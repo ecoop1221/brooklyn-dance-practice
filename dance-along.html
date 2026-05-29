@@ -1316,6 +1316,12 @@ let compositeRAF     = null;
 const COMP_W         = 1280;
 const COMP_H         = 720;
 
+// Web Audio API nodes — kept alive across recordings so we don't re-create
+// the MediaElementSource (browsers only allow one per element).
+let _webAudioCtx        = null;
+let _webAudioSrcNode    = null;   // MediaElementSourceNode for choreoVideo
+let _webAudioDestNode   = null;   // MediaStreamDestinationNode for recording
+
 // ── Multi-video state ──
 let videoFiles         = [];      // Array of File objects (max 5)
 let videoObjectURLs    = [];      // Blob URLs matching videoFiles
@@ -2124,6 +2130,59 @@ function pickMime() {
 const HOLD_IMG_IDS = ['svgArabesque', 'svgPasse', 'svgAttitude'];
 
 // ════════════════════════════════════════
+//  VIDEO AUDIO CAPTURE HELPER
+// ════════════════════════════════════════
+
+/**
+ * Returns a single audio MediaStreamTrack from a video element.
+ *
+ * Strategy 1 — captureStream() works on Chrome/Firefox desktop.
+ * Strategy 2 — Web Audio API works on iOS Safari (and everywhere else).
+ *   createMediaElementSource() can only be called once per element, so
+ *   we cache the source node globally and reconnect a fresh destination
+ *   each time recording starts.
+ */
+function getVideoAudioTrack(videoEl) {
+  // ── Strategy 1: captureStream / mozCaptureStream ──
+  try {
+    const s = videoEl.captureStream
+      ? videoEl.captureStream()
+      : videoEl.mozCaptureStream
+        ? videoEl.mozCaptureStream()
+        : null;
+    if (s) {
+      const tracks = s.getAudioTracks();
+      if (tracks.length > 0) return tracks[0];
+    }
+  } catch (e) { /* not supported on this browser */ }
+
+  // ── Strategy 2: Web Audio API (iOS Safari fallback) ──
+  try {
+    if (!_webAudioCtx) {
+      _webAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    // Resume if suspended (autoplay policy)
+    if (_webAudioCtx.state === 'suspended') { _webAudioCtx.resume(); }
+
+    // Create the source node only once — the browser throws if you call it twice
+    if (!_webAudioSrcNode) {
+      _webAudioSrcNode = _webAudioCtx.createMediaElementSource(videoEl);
+      // Reconnect to speakers so the user keeps hearing the video
+      _webAudioSrcNode.connect(_webAudioCtx.destination);
+    }
+
+    // Fresh destination node for each recording session
+    _webAudioDestNode = _webAudioCtx.createMediaStreamDestination();
+    _webAudioSrcNode.connect(_webAudioDestNode);
+
+    const tracks = _webAudioDestNode.stream.getAudioTracks();
+    if (tracks.length > 0) return tracks[0];
+  } catch (e) { /* Web Audio not supported */ }
+
+  return null; // no audio track available
+}
+
+// ════════════════════════════════════════
 //  COMPOSITE CANVAS CAPTURE (side-by-side + audio)
 // ════════════════════════════════════════
 
@@ -2193,24 +2252,14 @@ function startCompositeCapture(leftEl, rightEl, audioSourceEl) {
     return mediaStream;
   }
 
-  // Add audio from the uploaded video element (not the microphone)
+  // ── Add choreography video audio to the recording ──
+  // Uses captureStream() on desktop or Web Audio API on iOS Safari.
   if (audioSourceEl) {
-    try {
-      const srcStream = audioSourceEl.captureStream
-        ? audioSourceEl.captureStream()
-        : audioSourceEl.mozCaptureStream
-          ? audioSourceEl.mozCaptureStream()
-          : null;
-      if (srcStream) {
-        srcStream.getAudioTracks().forEach(t => {
-          try { canvasStream.addTrack(t); } catch (e) {}
-        });
-      }
-    } catch (e) {
-      // Audio capture not supported for this element — recording will be silent
+    const audioTrack = getVideoAudioTrack(audioSourceEl);
+    if (audioTrack) {
+      try { canvasStream.addTrack(audioTrack); } catch (e) {}
     }
   }
-  // Microphone audio is deliberately excluded from the recording.
 
   return canvasStream;
 }
@@ -2219,6 +2268,11 @@ function stopCompositeCapture() {
   if (compositeRAF) { cancelAnimationFrame(compositeRAF); compositeRAF = null; }
   compositeCanvas = null;
   compositeCtx    = null;
+  // Disconnect the Web Audio recording destination so it doesn't keep routing audio
+  if (_webAudioDestNode && _webAudioSrcNode) {
+    try { _webAudioSrcNode.disconnect(_webAudioDestNode); } catch (e) {}
+    _webAudioDestNode = null;
+  }
 }
 
 // ════════════════════════════════════════
